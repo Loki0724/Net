@@ -36,13 +36,17 @@ import com.drake.net.reflect.typeTokenOf
 import com.drake.net.response.convert
 import com.drake.net.tag.NetTag
 import kotlinx.coroutines.CoroutineExceptionHandler
+import kotlinx.coroutines.suspendCancellableCoroutine
 import okhttp3.*
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import java.io.File
 import java.lang.reflect.Type
 import java.net.URL
+import java.io.IOException
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import kotlin.reflect.typeOf
 
 abstract class BaseRequest {
@@ -488,6 +492,42 @@ abstract class BaseRequest {
         }
     }
     //</editor-fold>
+
+    /**
+     * 协程专用请求入口。使用 OkHttp 回调保持挂起可取消，并将取消及时传递给底层 Call。
+     * 公开同步 execute 保持原有行为，协程请求通过此桥接避免阻塞调用期间丢失取消信号。
+     */
+    @PublishedApi
+    internal suspend fun <R> executeCancellable(type: Type): R = suspendCancellableCoroutine { continuation ->
+        NetConfig.requestInterceptor?.interceptor(this)
+        val request = buildRequest()
+        val call = okHttpClient.newCall(request)
+        continuation.invokeOnCancellation { call.cancel() }
+        call.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                continuation.resumeWithException(e)
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                if (!continuation.isActive) {
+                    response.close()
+                    return
+                }
+                try {
+                    // 转换器读取正文期间仍保持取消钩子，因此下载和正文解析也能中断网络读取。
+                    val result = response.convert<R>(type)
+                    continuation.resume(result) { _, _, _ ->
+                        // 完成与取消可能并发；结果尚未交给调用方时必须关闭已收到的响应。
+                        response.close()
+                    }
+                } catch (e: Throwable) {
+                    // 与转换器保持相同的清理契约，保留导致请求失败的原始异常。
+                    runCatching { response.close() }
+                    continuation.resumeWithException(e)
+                }
+            }
+        })
+    }
 
     //<editor-fold desc="EnqueueRequest">
     /**

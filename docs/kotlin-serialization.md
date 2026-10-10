@@ -35,10 +35,12 @@ classpath "org.jetbrains.kotlin:kotlin-serialization:$kotlin_version"
 Model build.gradle
 
 ```kotlin
-apply plugin: "kotlin-kapt"
 apply plugin: 'kotlinx-serialization'
-implementation "org.jetbrains.kotlinx:kotlinx-serialization-json:1.3.0"
+implementation "org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0"
 ```
+
+AGP 9 使用内置 Kotlin；序列化器由 Kotlin 编译器插件生成，无需 kapt。
+本仓库示例因 Data Binding 额外应用 `com.android.legacy-kapt`。
 
 ## 配置转换器
 

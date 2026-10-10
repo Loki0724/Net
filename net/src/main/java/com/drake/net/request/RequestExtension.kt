@@ -112,7 +112,10 @@ inline fun <reified T> Request.tagOf(value: T?) = apply {
 }
 
 /**
- * 全部tag
+ * 全部 tag 的可变视图，修改会立即写回当前请求。
+ * 每次修改会替换 OkHttp 的不可变标签集合，已经通过 newBuilder() 派生的请求不会被影响。
+ * 标签应在请求发起前设置，避免在请求执行期间并发修改。
+ * 将某个类型对应的值设置为 null 等同于移除标签。
  */
 fun Request.tags(): MutableMap<Class<*>, Any?> {
     return OkHttpUtils.tags(this)

@@ -100,12 +100,17 @@ dependencyResolutionManagement {
 Module 的 build.gradle 添加依赖框架
 
 ```groovy
-implementation "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.6.0" // 协程(版本自定)
-implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.6.0'
-implementation 'com.squareup.okhttp3:okhttp:4.11.0' // 要求OkHttp4以上
-implementation 'com.github.liangjingkanji:Net:3.7.0'
+implementation platform('org.jetbrains.kotlinx:kotlinx-coroutines-bom:1.11.0')
+implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-core'
+implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android'
+implementation platform('com.squareup.okhttp3:okhttp-bom:5.5.0')
+implementation 'com.squareup.okhttp3:okhttp'
+implementation project(':net') // 本仓库尚未发布新的 Maven/JitPack 版本
 ```
 如果在 Android 5 (API level 21)以下开发, 请使用 [Net-okhttp3](https://github.com/liangjingkanji/Net-okhttp3)
+
+本 fork 使用 OkHttp 5.5.0，要求 `minSdk 21`、`compileSdk 37`、JDK 17、Kotlin 2.3.21。
+升级范围、兼容说明和验证命令见 [依赖升级说明](docs/dependency-upgrade.md)。
 <br>
 
 ## Contribute

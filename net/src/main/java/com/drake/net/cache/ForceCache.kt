@@ -27,16 +27,8 @@ import com.drake.net.request.tagOf
 import com.drake.net.tag.NetTag
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
-import okhttp3.internal.EMPTY_HEADERS
-import okhttp3.internal.cache.CacheRequest
 import okhttp3.internal.cache.DiskLruCache
-import okhttp3.internal.closeQuietly
-import okhttp3.internal.discard
-import okhttp3.internal.http.ExchangeCodec
-import okhttp3.internal.http.RealResponseBody
 import okhttp3.internal.http.StatusLine
-import okhttp3.internal.platform.Platform
-import okhttp3.internal.toLongOrDefault
 import okio.*
 import okio.ByteString.Companion.decodeBase64
 import okio.ByteString.Companion.encodeUtf8
@@ -166,20 +158,25 @@ class ForceCache internal constructor(
             return null
         }
 
-        val response = entry.response(snapshot, request.body)
+        // 使用调用方的请求构造缓存响应，保留标签和请求体；自定义缓存键允许不同请求共享条目。
+        val response = entry.response(snapshot, request)
         val value = request.tagOf<NetTag.CacheValidTime>()?.value
         return if (value != null && System.currentTimeMillis() - response.receivedResponseAtMillis > value) {
+            // 过期响应不会交给调用方，必须在此释放快照，否则 Windows 上会阻止条目更新与删除。
+            response.close()
             null
         } else {
-            response.newBuilder().request(request).build()
+            response
         }
     }
 
     internal fun put(response: Response): Response {
         if (!response.isSuccessful) return response
+        // HTTPS 的磁盘元数据需要 TLS 握手；人工构造且没有握手的响应不能按此格式持久化。
+        if (response.request.url.isHttps && response.handshake == null) return response
         val entry = Entry(response)
         var editor: DiskLruCache.Editor? = null
-        val cacheRequest: CacheRequest? = try {
+        val cacheRequest: RealCacheRequest? = try {
             editor = cache.edit(key(response.request)) ?: return response
             entry.writeTo(editor)
             RealCacheRequest(editor)
@@ -187,38 +184,37 @@ class ForceCache internal constructor(
             abortQuietly(editor)
             null
         }
-        // Some apps return a null body; for compatibility we treat that like a null cache request.
         cacheRequest ?: return response
         val cacheBody = cacheRequest.body().buffer()
-        val responseBody = response.body ?: return response
+        // OkHttp 5 的响应体始终非空，无内容响应会提供空响应体，同样需要正常提交缓存事务。
+        val responseBody = response.body
         val source = responseBody.source()
         val cacheWritingSource = object : Source {
             private var cacheRequestClosed = false
 
             @Throws(IOException::class)
             override fun read(sink: Buffer, byteCount: Long): Long {
-                val bytesRead: Long
                 try {
-                    bytesRead = source.read(sink, byteCount)
+                    val bytesRead = source.read(sink, byteCount)
+                    if (bytesRead == -1L) {
+                        if (!cacheRequestClosed) {
+                            cacheRequestClosed = true
+                            cacheBody.close()
+                        }
+                        return -1
+                    }
+
+                    sink.copyTo(cacheBody.buffer, sink.size - bytesRead, bytesRead)
+                    cacheBody.emitCompleteSegments()
+                    return bytesRead
                 } catch (e: IOException) {
                     if (!cacheRequestClosed) {
                         cacheRequestClosed = true
-                        cacheRequest.abort() // Failed to write a complete cache response.
+                        // 网络读取或缓存写入中断后都废弃事务，避免部分正文被当成完整缓存。
+                        cacheRequest.abort()
                     }
                     throw e
                 }
-
-                if (bytesRead == -1L) {
-                    if (!cacheRequestClosed) {
-                        cacheRequestClosed = true
-                        cacheBody.close() // The cache response is complete!
-                    }
-                    return -1
-                }
-
-                sink.copyTo(cacheBody.buffer, sink.size - bytesRead, bytesRead)
-                cacheBody.emitCompleteSegments()
-                return bytesRead
             }
 
             override fun timeout() = source.timeout()
@@ -226,7 +222,7 @@ class ForceCache internal constructor(
             @Throws(IOException::class)
             override fun close() {
                 if (!cacheRequestClosed &&
-                    !discard(ExchangeCodec.DISCARD_STREAM_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)) {
+                    !discardRemaining()) {
                     cacheRequestClosed = true
                     cacheRequest.abort()
                 }
@@ -236,7 +232,15 @@ class ForceCache internal constructor(
         val contentType = response.header("Content-Type")
         val contentLength = responseBody.contentLength()
         return response.newBuilder()
-            .body(RealResponseBody(contentType, contentLength, cacheWritingSource.buffer()))
+            .body(object : ResponseBody() {
+                private val bufferedSource = cacheWritingSource.buffer()
+
+                override fun contentType(): MediaType? = contentType?.toMediaTypeOrNull()
+
+                override fun contentLength(): Long = contentLength
+
+                override fun source(): BufferedSource = bufferedSource
+            })
             .build()
     }
 
@@ -247,15 +251,39 @@ class ForceCache internal constructor(
 
     internal fun update(cached: Response, network: Response) {
         val entry = Entry(network)
-        val snapshot = (cached.body as CacheResponseBody).snapshot
+        val body = cached.body as? CacheResponseBody ?: return
+        val snapshot = body.snapshot
         var editor: DiskLruCache.Editor? = null
         try {
-            editor = snapshot.edit() ?: return // edit() returns null if snapshot is not current.
+            editor = editIfOpen(snapshot)
+            if (editor == null) {
+                // Windows 不允许编辑仍有打开读流的条目。正文关闭后再更新，保留正在读取的正文。
+                // snapshot.edit 仍校验原序列号，因此不会覆盖期间已被其他请求替换的条目。
+                body.afterClose {
+                    var deferredEditor: DiskLruCache.Editor? = null
+                    try {
+                        deferredEditor = editIfOpen(snapshot) ?: return@afterClose
+                        entry.writeTo(deferredEditor)
+                        deferredEditor.commit()
+                    } catch (_: IOException) {
+                        abortQuietly(deferredEditor)
+                    }
+                }
+                return
+            }
             entry.writeTo(editor)
             editor.commit()
         } catch (_: IOException) {
             abortQuietly(editor)
         }
+    }
+
+    /**
+     * 与 DiskLruCache.close 使用相同锁，避免检查完成后缓存被关闭、编辑器抛出状态异常。
+     * 仍通过快照编辑，保留序列号校验，已关闭或已被替换的缓存都直接放弃元数据更新。
+     */
+    private fun editIfOpen(snapshot: DiskLruCache.Snapshot): DiskLruCache.Editor? = synchronized(cache) {
+        if (cache.isClosed()) null else snapshot.edit()
     }
 
     private fun abortQuietly(editor: DiskLruCache.Editor?) {
@@ -375,11 +403,11 @@ class ForceCache internal constructor(
 
     @get:JvmName("directory")
     val directory: File
-        get() = cache.directory
+        get() = cache.directory.toFile()
 
     private inner class RealCacheRequest(
         private val editor: DiskLruCache.Editor
-    ) : CacheRequest {
+    ) {
         private val cacheOut: Sink = editor.newSink(ENTRY_BODY)
         private val body: Sink
         var done = false
@@ -391,15 +419,26 @@ class ForceCache internal constructor(
                     synchronized(this@ForceCache) {
                         if (done) return
                         done = true
-                        writeSuccessCount++
                     }
-                    super.close()
-                    editor.commit()
+                    try {
+                        super.close()
+                        editor.commit()
+                        synchronized(this@ForceCache) {
+                            writeSuccessCount++
+                        }
+                    } catch (e: IOException) {
+                        // 提交失败不能计为成功，且必须释放编辑器，允许下次网络响应重新写入。
+                        synchronized(this@ForceCache) {
+                            writeAbortCount++
+                        }
+                        abortQuietly(editor)
+                        throw e
+                    }
                 }
             }
         }
 
-        override fun abort() {
+        fun abort() {
             synchronized(this@ForceCache) {
                 if (done) return
                 done = true
@@ -412,7 +451,7 @@ class ForceCache internal constructor(
             }
         }
 
-        override fun body(): Sink = body
+        fun body(): Sink = body
     }
 
     private class Entry {
@@ -496,6 +535,7 @@ class ForceCache internal constructor(
                 val statusLine = StatusLine.parse(source.readUtf8LineStrict())
                 protocol = statusLine.protocol
                 code = statusLine.code
+                if (code < 0) throw IOException("Invalid cached status code: $code")
                 message = statusLine.message
                 val responseHeadersBuilder = Headers.Builder()
                 val responseHeaderLineCount = readInt(source)
@@ -506,8 +546,8 @@ class ForceCache internal constructor(
                 val receivedResponseMillisString = responseHeadersBuilder[RECEIVED_MILLIS]
                 responseHeadersBuilder.removeAll(SENT_MILLIS)
                 responseHeadersBuilder.removeAll(RECEIVED_MILLIS)
-                sentRequestMillis = sendRequestMillisString?.toLong() ?: 0L
-                receivedResponseMillis = receivedResponseMillisString?.toLong() ?: 0L
+                sentRequestMillis = readMillis(sendRequestMillisString)
+                receivedResponseMillis = readMillis(receivedResponseMillisString)
                 responseHeaders = responseHeadersBuilder.build()
 
                 if (isHttps) {
@@ -519,10 +559,14 @@ class ForceCache internal constructor(
                     val cipherSuite = CipherSuite.forJavaName(cipherSuiteString)
                     val peerCertificates = readCertificateList(source)
                     val localCertificates = readCertificateList(source)
-                    val tlsVersion = if (!source.exhausted()) {
-                        TlsVersion.forJavaName(source.readUtf8LineStrict())
-                    } else {
-                        TlsVersion.SSL_3_0
+                    val tlsVersion = try {
+                        if (!source.exhausted()) {
+                            TlsVersion.forJavaName(source.readUtf8LineStrict())
+                        } else {
+                            TlsVersion.SSL_3_0
+                        }
+                    } catch (e: IllegalArgumentException) {
+                        throw IOException("Invalid cached TLS version", e)
                     }
                     handshake = Handshake.get(tlsVersion, cipherSuite, peerCertificates, localCertificates)
                 } else {
@@ -588,8 +632,11 @@ class ForceCache internal constructor(
 
         @Throws(IOException::class)
         private fun readCertificateList(source: BufferedSource): List<Certificate> {
-            val length = readInt(source)
+            // 旧版 OkHttp 使用 -1 表示没有证书，因此这里不能使用只接受非负数的 readInt。
+            val length = source.readUtf8LineStrict().toIntOrNull()
+                ?: throw IOException("Invalid cached certificate count")
             if (length == -1) return emptyList() // OkHttp v1.2 used -1 to indicate null.
+            if (length < 0) throw IOException("Invalid cached certificate count: $length")
 
             try {
                 val certificateFactory = CertificateFactory.getInstance("X.509")
@@ -597,7 +644,7 @@ class ForceCache internal constructor(
                 for (i in 0 until length) {
                     val line = source.readUtf8LineStrict()
                     val bytes = Buffer()
-                    bytes.write(line.decodeBase64()!!)
+                    bytes.write(line.decodeBase64() ?: throw IOException("Invalid cached certificate"))
                     result.add(certificateFactory.generateCertificate(bytes.inputStream()))
                 }
                 return result
@@ -620,16 +667,11 @@ class ForceCache internal constructor(
             }
         }
 
-        fun response(snapshot: DiskLruCache.Snapshot, requestBody: RequestBody?): Response {
+        fun response(snapshot: DiskLruCache.Snapshot, request: Request): Response {
             val contentType = responseHeaders["Content-Type"]
             val contentLength = responseHeaders["Content-Length"]
-            val cacheRequest = Request.Builder()
-                .url(url)
-                .method(requestMethod, requestBody)
-                .headers(varyHeaders)
-                .build()
             val builder = Response.Builder()
-                .request(cacheRequest)
+                .request(request)
                 .protocol(protocol)
                 .code(code)
                 .message(message)
@@ -644,11 +686,14 @@ class ForceCache internal constructor(
         }
 
         companion object {
-            /** Synthetic response header: the local time when the request was sent. */
-            private val SENT_MILLIS = "${Platform.get().getPrefix()}-Sent-Millis"
+            // 固定名称与 OkHttp 4/5 的磁盘缓存格式一致，避免依赖 Platform 内部接口。
+            private const val SENT_MILLIS = "OkHttp-Sent-Millis"
 
-            /** Synthetic response header: the local time when the response was received. */
-            private val RECEIVED_MILLIS = "${Platform.get().getPrefix()}-Received-Millis"
+            private const val RECEIVED_MILLIS = "OkHttp-Received-Millis"
+
+            private fun readMillis(value: String?): Long =
+                if (value == null) 0L else value.toLongOrNull()
+                    ?: throw IOException("Invalid cached timestamp: $value")
         }
     }
 
@@ -658,21 +703,46 @@ class ForceCache internal constructor(
         private val contentLength: String?
     ) : ResponseBody() {
         private val bodySource: BufferedSource
+        private var closed = false
+        private var closeAction: (() -> Unit)? = null
+
+        fun afterClose(action: () -> Unit) {
+            val alreadyClosed = synchronized(this) {
+                if (closed) true else {
+                    closeAction = action
+                    false
+                }
+            }
+            if (alreadyClosed) action()
+        }
+
+        private fun onClosed() {
+            val action = synchronized(this) {
+                if (closed) return
+                closed = true
+                closeAction.also { closeAction = null }
+            }
+            action?.invoke()
+        }
 
         init {
             val source = snapshot.getSource(ENTRY_BODY)
             bodySource = object : ForwardingSource(source) {
                 @Throws(IOException::class)
                 override fun close() {
-                    snapshot.close()
-                    super.close()
+                    try {
+                        snapshot.close()
+                        super.close()
+                    } finally {
+                        onClosed()
+                    }
                 }
             }.buffer()
         }
 
         override fun contentType(): MediaType? = contentType?.toMediaTypeOrNull()
 
-        override fun contentLength(): Long = contentLength?.toLongOrDefault(-1L) ?: -1L
+        override fun contentLength(): Long = contentLength?.toLongOrNull() ?: -1L
 
         override fun source(): BufferedSource = bodySource
     }
@@ -680,6 +750,37 @@ class ForceCache internal constructor(
     companion object {
         private const val ENTRY_METADATA = 0
         private const val ENTRY_BODY = 1
+
+        /** 缓存读写失败只影响缓存，不应阻止关闭网络响应或释放磁盘快照。 */
+        private fun Closeable.closeQuietly() {
+            try {
+                close()
+            } catch (_: IOException) {
+            }
+        }
+
+        /**
+         * 提前关闭时最多用 100 毫秒读完剩余响应，使完整响应仍可提交缓存。
+         * 临时截止时间不能延长原有网络超时，并须在结束后恢复，避免改变复用连接的后续行为。
+         */
+        private fun Source.discardRemaining(): Boolean {
+            val timeout = timeout()
+            val hadDeadline = timeout.hasDeadline()
+            val originalDeadline = if (hadDeadline) timeout.deadlineNanoTime() else Long.MAX_VALUE
+            val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(100)
+            timeout.deadlineNanoTime(minOf(originalDeadline, deadline))
+            return try {
+                val skipped = Buffer()
+                while (read(skipped, 8192) != -1L) {
+                    skipped.clear()
+                }
+                true
+            } catch (_: IOException) {
+                false
+            } finally {
+                if (hadDeadline) timeout.deadlineNanoTime(originalDeadline) else timeout.clearDeadline()
+            }
+        }
 
         @JvmStatic
         fun key(request: Request): String {
@@ -745,7 +846,7 @@ class ForceCache internal constructor(
         fun Response.varyHeaders(): Headers {
             // Use the request headers sent over the network, since that's what the response varies on.
             // Otherwise OkHttp-supplied headers like "Accept-Encoding: gzip" may be lost.
-            val requestHeaders = networkResponse!!.request.headers
+            val requestHeaders = networkResponse?.request?.headers ?: request.headers
             val responseHeaders = headers
             return varyHeaders(requestHeaders, responseHeaders)
         }
@@ -756,7 +857,7 @@ class ForceCache internal constructor(
          */
         private fun varyHeaders(requestHeaders: Headers, responseHeaders: Headers): Headers {
             val varyFields = responseHeaders.varyFields()
-            if (varyFields.isEmpty()) return EMPTY_HEADERS
+            if (varyFields.isEmpty()) return Headers.Builder().build()
 
             val result = Headers.Builder()
             for (i in 0 until requestHeaders.size) {

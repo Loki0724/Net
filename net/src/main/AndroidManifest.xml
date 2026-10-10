@@ -24,10 +24,11 @@
   -->
 
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:tools="http://schemas.android.com/tools"
-    package="com.drake.net">
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- isNetworking() 读取 ConnectivityManager 所需的普通权限，由清单合并提供给宿主。 -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <application
         android:networkSecurityConfig="@xml/network_security_config"

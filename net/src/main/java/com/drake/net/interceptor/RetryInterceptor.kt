@@ -27,7 +27,6 @@ package com.drake.net.interceptor
 import androidx.annotation.IntRange
 import okhttp3.Interceptor
 import okhttp3.Response
-import okhttp3.internal.closeQuietly
 
 /**
  * 重试次数拦截器
@@ -41,9 +40,11 @@ class RetryInterceptor(@IntRange(from = 1) var retryCount: Int = 3) : Intercepto
         var retryCount = 0
         val request = chain.request()
         var response = chain.proceed(request)
-        while (!response.isSuccessful && retryCount < this.retryCount) {
+        // 一次性流无法重放，双工流可能仍在发送；取消后的请求也不应再次发起。
+        val replayable = request.body?.let { !it.isOneShot() && !it.isDuplex() } ?: true
+        while (!response.isSuccessful && replayable && !chain.call().isCanceled() && retryCount < this.retryCount) {
             retryCount++
-            response.closeQuietly()
+            response.close()
             response = chain.proceed(request)
         }
         return response

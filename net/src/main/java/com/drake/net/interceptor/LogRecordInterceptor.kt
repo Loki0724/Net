@@ -78,6 +78,10 @@ open class LogRecordInterceptor @JvmOverloads constructor(
      */
     protected open fun getRequestLog(request: Request): String? {
         val body = request.body ?: return null
+        // 读取日志会调用 writeTo；一次性流只能发送一次，双工流可能在返回后继续异步写入。
+        // 这两类正文不能预读，否则日志本身会消耗上传数据或触发额外发送。
+        if (body.isOneShot()) return "One-shot request body omitted"
+        if (body.isDuplex()) return "Duplex request body omitted"
         val mediaType = body.contentType()
         return when {
             body is MultipartBody -> {

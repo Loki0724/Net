@@ -33,7 +33,6 @@ import com.drake.net.request.*
 import com.drake.net.tag.NetTag
 import com.drake.net.utils.md5
 import okhttp3.Response
-import okhttp3.internal.closeQuietly
 import okio.buffer
 import okio.sink
 import java.io.File
@@ -97,6 +96,8 @@ fun Response.file(): File? {
             if (request.downloadMd5Verify()) {
                 val md5Header = header("Content-MD5")
                 if (md5Header != null && file.md5(true) == md5Header) {
+                    // 复用本地文件不再读取本次响应，返回前关闭正文以释放连接和运行中的请求记录。
+                    close()
                     val downloadListeners = request.tagOf<NetTag.DownloadListeners>()
                     if (!downloadListeners.isNullOrEmpty()) {
                         val fileSize = file.length()
@@ -133,9 +134,11 @@ fun Response.file(): File? {
         }
         val source = body?.source() ?: return null
         if (!file.exists()) file.createNewFile()
-        file.sink().buffer().use {
-            it.writeAll(source)
-            source.closeQuietly()
+        // source 与文件 sink 分别由 use 管理，写入失败也会关闭响应并释放连接。
+        source.use { input ->
+            file.sink().buffer().use { output ->
+                output.writeAll(input)
+            }
         }
         // 下载完毕删除临时文件
         if (request.downloadTempFile()) {
@@ -162,10 +165,14 @@ inline fun <reified R> Response.convert(): R {
     try {
         return request.converter().onConvert<R>(typeTokenOf<R>(), this) as R
     } catch (e: CancellationException) {
+        // 转换失败或取消时调用方拿不到响应，必须释放正文；清理错误不能覆盖原始异常。
+        runCatching { close() }
         throw e
     } catch (e: NetException) {
+        runCatching { close() }
         throw e
     } catch (e: Throwable) {
+        runCatching { close() }
         throw ConvertException(this, message = "An unexpected error occurred in the converter", cause = e)
     }
 }
@@ -181,10 +188,14 @@ fun <R> Response.convert(type: Type): R {
     try {
         return request.converter().onConvert<R>(type, this) as R
     } catch (e: CancellationException) {
+        // Java/Type 入口与 reified 入口保持相同的异常清理语义。
+        runCatching { close() }
         throw e
     } catch (e: NetException) {
+        runCatching { close() }
         throw e
     } catch (e: Throwable) {
+        runCatching { close() }
         throw ConvertException(this, message = "An unexpected error occurred in the converter", cause = e)
     }
 }

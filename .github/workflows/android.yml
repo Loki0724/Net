@@ -1,0 +1,37 @@
+name: Android Compatibility
+
+on:
+  pull_request:
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK
+        run: sdkmanager 'platforms;android-37.0' 'build-tools;36.0.0'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Run Tests And Verify Release Compilation
+        # 覆盖两个构建变体与 R8 混淆，不执行 APK 打包或签名。
+        run: bash gradlew :net:testDebugUnitTest :net:testReleaseUnitTest :net:testMinifiedTags :net:lintRelease :sample:testDebugUnitTest :sample:compileDebugJavaWithJavac :sample:minifyReleaseWithR8 :sample:lintVitalRelease :net:dokkaGeneratePublicationHtml -PdokkaOutputDir="$PWD/build/dokka-verification" --console=plain
+      - name: Upload Test Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compatibility-test-reports
+          path: |
+            net/build/reports/tests/
+            sample/build/reports/tests/
+            net/build/reports/lint-results-release.*
+            sample/build/reports/lint-results-vitalRelease.*

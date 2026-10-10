@@ -71,7 +71,7 @@ var Request.Builder.kType: KType?
     }
 
 /**
- * 全部的请求头
+ * 全部的请求头。返回构造器实际持有的可变请求头，修改后会参与后续 build()。
  */
 fun Request.Builder.headers(): Headers.Builder {
     return OkHttpUtils.headers(this)
@@ -123,7 +123,9 @@ inline fun <reified T> Request.Builder.tagOf(value: T?) = apply {
 }
 
 /**
- * 全部tag
+ * 全部 tag 的可变视图，修改会立即写回构造器。
+ * OkHttp 5.5 使用不可变标签集合；已经 build() 的请求不会被后续构造器修改影响。
+ * 将某个类型对应的值设置为 null 等同于移除标签。
  */
 fun Request.Builder.tags(): MutableMap<Class<*>, Any?> {
     return OkHttpUtils.tags(this)

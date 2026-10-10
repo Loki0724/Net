@@ -62,9 +62,10 @@ object NetOkHttpInterceptor : Interceptor {
         }.method(request.method, reqBody).build()
 
         var response: Response? = null
+        var returnedResponse = false
         try {
             appendRunningCall(chain)
-            response = if (cache != null) {
+            val receivedResponse = if (cache != null) {
                 when (cacheMode) {
                     CacheMode.READ -> cache.get(request) ?: throw NoCacheException(request)
                     CacheMode.READ_THEN_REQUEST -> cache.get(request) ?: chain.proceed(request).run {
@@ -88,11 +89,14 @@ object NetOkHttpInterceptor : Interceptor {
             } else {
                 chain.proceed(request)
             }
-            val respBody = response.body?.toNetResponseBody(request.tagOf<NetTag.DownloadListeners>()) {
+            response = receivedResponse
+            // OkHttp 5 保证 Response.body 非空，空响应也通过包装器关闭时完成请求清理。
+            val respBody = receivedResponse.body.toNetResponseBody(request.tagOf<NetTag.DownloadListeners>()) {
                 removeRunningCall(chain)
             }
-            response = response.newBuilder().body(respBody).build()
-            return response
+            val wrappedResponse = receivedResponse.newBuilder().body(respBody).build()
+            returnedResponse = true
+            return wrappedResponse
         } catch (e: SocketTimeoutException) {
             throw NetSocketTimeoutException(request, e.message, e)
         } catch (e: ConnectException) {
@@ -104,7 +108,9 @@ object NetOkHttpInterceptor : Interceptor {
         } catch (e: Throwable) {
             throw HttpFailureException(request, cause = e)
         } finally {
-            if (response?.body == null) {
+            if (!returnedResponse) {
+                // 收到响应后包装失败的路径也必须关闭正文，避免连接和运行记录遗留。
+                response?.close()
                 removeRunningCall(chain)
             }
         }

@@ -265,20 +265,27 @@ open class Interval @JvmOverloads constructor(
     private fun launch(delay: Long = unit.toMillis(initialDelay)) {
         scope = CoroutineScope(Dispatchers.Main)
         scope?.launch {
-            ticker = ticker(unit.toMillis(period), delay, mode = TickerMode.FIXED_DELAY)
-            for (unit in ticker) {
-                subscribeList.forEach {
-                    it.invoke(this@Interval, count)
-                }
-                if (end != -1L && count == end) {
-                    scope?.cancel()
-                    state = IntervalStatus.STATE_IDLE
-                    finishList.forEach {
+            // 用局部引用绑定本次生产协程，避免快速 reset/resume 时旧任务取消新 ticker。
+            val activeTicker = ticker(unit.toMillis(period), delay, mode = TickerMode.FIXED_DELAY)
+            ticker = activeTicker
+            try {
+                for (unit in activeTicker) {
+                    subscribeList.forEach {
                         it.invoke(this@Interval, count)
                     }
+                    if (end != -1L && count == end) {
+                        scope?.cancel()
+                        state = IntervalStatus.STATE_IDLE
+                        finishList.forEach {
+                            it.invoke(this@Interval, count)
+                        }
+                    }
+                    if (end != -1L && start > end) count-- else count++
+                    countTime = System.currentTimeMillis()
                 }
-                if (end != -1L && start > end) count-- else count++
-                countTime = System.currentTimeMillis()
+            } finally {
+                // ticker 的生产协程独立于 scope；销毁、暂停和结束时必须显式取消。
+                activeTicker.cancel()
             }
         }
     }

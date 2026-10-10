@@ -74,6 +74,7 @@ markdown_extensions:
 
 nav:
   - 使用: index.md
+  - 依赖升级: dependency-upgrade.md
   - 协程请求: coroutine-request.md
   - 作用域: scope.md
   - 同步请求: sync-request.md

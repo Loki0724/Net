@@ -31,6 +31,7 @@ import okhttp3.ResponseBody
 import okio.*
 import java.io.IOException
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicBoolean
 
 class NetResponseBody(
     private val body: ResponseBody,
@@ -41,6 +42,12 @@ class NetResponseBody(
     private val progress = Progress()
     private val bufferedSource by lazy { body.source().toProgress().buffer() }
     private val contentLength by lazy { body.contentLength() }
+    private val completed = AtomicBoolean(false)
+
+    // 读完、异常和主动关闭都结束请求；多个终止路径只能通知一次，避免重复清理请求队列。
+    private fun completeOnce() {
+        if (completed.compareAndSet(false, true)) complete?.invoke()
+    }
 
     override fun contentType(): MediaType? {
         return body.contentType()
@@ -61,34 +68,45 @@ class NetResponseBody(
         override fun read(sink: Buffer, byteCount: Long): Long {
             try {
                 val bytesRead = super.read(sink, byteCount)
+                // 即使监听器稍后才添加，也要保留已经读取的字节数供后续进度使用。
+                readByteCount += if (bytesRead != -1L) bytesRead else 0
                 if (!progressListeners.isNullOrEmpty()) {
-                    readByteCount += if (bytesRead != -1L) bytesRead else 0
                     val currentElapsedTime = SystemClock.elapsedRealtime()
+                    val finished = readByteCount == contentLength || bytesRead == -1L
+                    val alreadyFinished = progress.finish
                     progressListeners.forEach { progressListener ->
                         progressListener.intervalByteCount += if (bytesRead != -1L) bytesRead else 0
                         val currentInterval = currentElapsedTime - progressListener.elapsedTime
-                        if (!progress.finish && (readByteCount == contentLength || bytesRead == -1L || currentInterval >= progressListener.interval)) {
-                            if (readByteCount == contentLength || bytesRead == -1L) {
-                                progress.finish = true
-                            }
+                        if (!alreadyFinished && (finished || currentInterval >= progressListener.interval)) {
                             progressListener.onProgress(
                                 progress.apply {
                                     currentByteCount = readByteCount
                                     totalByteCount = contentLength
                                     intervalByteCount = progressListener.intervalByteCount
                                     intervalTime = currentInterval
+                                    finish = finished
                                 }
                             )
                             progressListener.elapsedTime = currentElapsedTime
                             progressListener.intervalByteCount = 0L
                         }
                     }
+                    progress.finish = finished
                 }
-                if (bytesRead == -1L) complete?.invoke()
+                if (bytesRead == -1L) completeOnce()
                 return bytesRead
             } catch (e: Exception) {
-                complete?.invoke()
+                completeOnce()
                 throw e
+            }
+        }
+
+        override fun close() {
+            try {
+                super.close()
+            } finally {
+                // 调用方可能只读取响应头或部分正文，关闭时也必须释放运行中的请求记录。
+                completeOnce()
             }
         }
     }

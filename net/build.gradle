@@ -1,40 +1,136 @@
 apply plugin: "com.android.library"
-apply plugin: "kotlin-android"
 apply plugin: 'org.jetbrains.dokka'
 
 android {
-    compileSdkVersion 30
+    namespace 'com.drake.net'
+    compileSdk 37
     defaultConfig {
-        minSdkVersion 19
-        targetSdkVersion 30
-        versionCode 1
-        versionName "1.0"
+        // OkHttp 5 与所选 AndroidX 版本均要求 Android 5.0（API 21）以上。
+        minSdk 21
+        targetSdk 36
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         consumerProguardFiles "consumer-rules.pro"
     }
 
-    kotlinOptions {
-        freeCompilerArgs = ["-Xinline-classes", "-Xallow-result-return-type"]
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
     }
 
-    dokkaHtml {
-        outputDirectory.set(file("$rootDir/docs/api"))
-        suppressInheritedMembers.set(true)
-        moduleName.set("Net")
+    buildFeatures {
+        buildConfig true
+    }
+
+    testOptions {
+        unitTests.includeAndroidResources = true
     }
 }
 
+// AGP 9 默认只启用库的调试单元测试，显式开启发布变体以验证两套编译输出。
+androidComponents {
+    beforeVariants(selector().all()) { variantBuilder ->
+        variantBuilder.hostTests.get('UnitTest').enable = true
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_1_8
+    }
+}
+
+dokka {
+    moduleName = 'Net'
+    dokkaPublications.html {
+        outputDirectory = file(providers.gradleProperty('dokkaOutputDir').getOrElse("$rootDir/docs/api"))
+    }
+    dokkaSourceSets.configureEach {
+        suppressInheritedMembers = true
+    }
+}
 
 dependencies {
-    implementation 'androidx.appcompat:appcompat:1.3.1'
-    implementation 'androidx.startup:startup-runtime:1.0.0'
-    implementation 'androidx.documentfile:documentfile:1.0.1'
-    implementation "androidx.lifecycle:lifecycle-runtime-ktx:2.6.2"
+    // AGP 要求编译与运行时依赖版本一致，BOM 同步 AndroidX 间接引入的协程版本。
+    implementation platform("org.jetbrains.kotlinx:kotlinx-coroutines-bom:$coroutine_version")
+    implementation "androidx.appcompat:appcompat:$appcompat_version"
+    implementation 'androidx.startup:startup-runtime:1.2.0'
+    implementation 'androidx.documentfile:documentfile:1.1.0'
+    implementation "androidx.lifecycle:lifecycle-runtime-ktx:$lifecycle_version"
 
     compileOnly "com.squareup.okhttp3:okhttp:$okhttp_version"
 
     compileOnly "com.github.liangjingkanji:BRV:$brv_version"
     compileOnly "org.jetbrains.kotlinx:kotlinx-coroutines-core:$coroutine_version"
     compileOnly "org.jetbrains.kotlinx:kotlinx-coroutines-android:$coroutine_version"
+
+    // compileOnly 依赖不会自动进入测试运行时，回归测试需显式引入真实网络与协程实现。
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation "com.squareup.okhttp3:okhttp:$okhttp_version"
+    testImplementation "com.squareup.okhttp3:mockwebserver3:$okhttp_version"
+    testImplementation "com.squareup.okhttp3:okhttp-tls:$okhttp_version"
+    testImplementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:$coroutine_version"
+    testImplementation "org.jetbrains.kotlinx:kotlinx-coroutines-test:$coroutine_version"
+    testImplementation "com.github.liangjingkanji:BRV:$brv_version"
+    // 4.14.1 仍提供 API 21 的 Android framework shadow，用于验证最低支持系统。
+    testImplementation 'org.robolectric:robolectric:4.14.1'
+}
+
+// 在 JVM 上直接执行混淆后的标签桥接，验证 consumer 规则，而无需生成或安装 APK。
+configurations {
+    minifiedSmokeRuntime
+    minifiedSmokeR8
+}
+
+dependencies {
+    minifiedSmokeRuntime "com.squareup.okhttp3:okhttp-jvm:$okhttp_version"
+    minifiedSmokeRuntime "org.jetbrains.kotlin:kotlin-stdlib:$kotlin_version"
+    minifiedSmokeR8 'com.android.tools:r8:9.3.28'
+}
+
+def smokeClasses = layout.buildDirectory.dir('minifiedSmoke/classes')
+def smokeOutput = layout.buildDirectory.dir('minifiedSmoke/output')
+
+def compileSmoke = tasks.register('compileMinifiedSmoke', JavaCompile) {
+    source 'src/main/java/okhttp3/OkHttpUtils.java', 'src/testMinified/java/TagMinifySmoke.java'
+    classpath = configurations.minifiedSmokeRuntime
+    destinationDirectory = smokeClasses
+    sourceCompatibility = '1.8'
+    targetCompatibility = '1.8'
+    options.encoding = 'UTF-8'
+}
+
+def smokeJar = tasks.register('jarMinifiedSmoke', Jar) {
+    dependsOn compileSmoke
+    from smokeClasses
+    archiveFileName = 'smoke-input.jar'
+    destinationDirectory = layout.buildDirectory.dir('minifiedSmoke')
+}
+
+def minifySmoke = tasks.register('minifyTagSmoke', JavaExec) {
+    dependsOn smokeJar
+    classpath = configurations.minifiedSmokeR8
+    mainClass = 'com.android.tools.r8.R8'
+    inputs.files(configurations.minifiedSmokeRuntime, smokeJar.flatMap { it.archiveFile },
+        'consumer-rules.pro', 'src/testMinified/smoke.pro')
+    outputs.dir(smokeOutput)
+    doFirst {
+        // 清理上次混淆输出，避免已移除的旧类残留，让运行结果只来自本次 R8 产物。
+        project.delete(smokeOutput)
+        smokeOutput.get().asFile.mkdirs()
+        args = ['--release', '--classfile', '--output', smokeOutput.get().asFile.absolutePath,
+            '--lib', System.getProperty('java.home'),
+            '--pg-conf', file('consumer-rules.pro').absolutePath,
+            '--pg-conf', file('src/testMinified/smoke.pro').absolutePath,
+            smokeJar.get().archiveFile.get().asFile.absolutePath] +
+            configurations.minifiedSmokeRuntime.files.collect { it.absolutePath }
+    }
+}
+
+tasks.register('testMinifiedTags', JavaExec) {
+    group = 'verification'
+    description = '执行经 R8 优化和混淆后的 OkHttp 标签兼容性冒烟测试。'
+    dependsOn minifySmoke
+    classpath = files(smokeOutput)
+    mainClass = 'TagMinifySmoke'
 }

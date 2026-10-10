@@ -1,6 +1,5 @@
 package com.drake.net.sample.utils
 
-import okhttp3.internal.closeQuietly
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -39,7 +38,11 @@ object RandomFileUtils {
         } catch (e: IOException) {
             e.printStackTrace()
         } finally {
-            fos?.closeQuietly()
+            // 文件关闭失败不覆盖已经记录的写入异常，也不依赖 OkHttp 内部扩展。
+            try {
+                fos?.close()
+            } catch (_: IOException) {
+            }
         }
         return false
     }

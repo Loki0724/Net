@@ -55,7 +55,9 @@ fun RequestBody.peekBytes(byteCount: Long = 1024 * 1024): ByteString {
  */
 fun ResponseBody.peekBytes(byteCount: Long = 1024 * 1024): ByteString {
     val peeked = source().peek()
-    peeked.request(byteCount)
+    // 负数表示全部正文，Okio 的 request 不允许负数；使用最大长度读取直到 EOF。
+    // peek 保留原 source 的读取位置，因此完整日志不会消耗调用方随后读取的响应。
+    peeked.request(if (byteCount < 0) Long.MAX_VALUE else byteCount)
     val maxSize = if (byteCount < 0) peeked.buffer.size else minOf(byteCount, peeked.buffer.size)
     return peeked.readByteString(maxSize)
 }

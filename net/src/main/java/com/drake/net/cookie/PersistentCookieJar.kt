@@ -31,6 +31,7 @@ import android.database.sqlite.SQLiteOpenHelper
 import okhttp3.Cookie
 import okhttp3.CookieJar
 import okhttp3.HttpUrl
+import java.io.Closeable
 
 /**
  * 持久化存储Cookie
@@ -39,15 +40,33 @@ import okhttp3.HttpUrl
 class PersistentCookieJar(
     val context: Context,
     val dbName: String = "net_cookies",
-) : CookieJar {
+) : CookieJar, Closeable {
 
-    private var sqlHelper: SQLiteOpenHelper = object : SQLiteOpenHelper(context, dbName, null, 1) {
+    private var sqlHelper: SQLiteOpenHelper = object : SQLiteOpenHelper(context, dbName, null, 2) {
         override fun onCreate(db: SQLiteDatabase) {
-            db.execSQL("CREATE TABLE IF NOT EXISTS cookies (url TEXT, name TEXT, cookie TEXT, PRIMARY KEY(url, name))")
+            // Cookie 的身份由域名、名称和路径共同决定，同名不同路径必须同时保留。
+            db.execSQL("CREATE TABLE IF NOT EXISTS cookies (url TEXT, name TEXT, path TEXT, cookie TEXT, PRIMARY KEY(url, name, path))")
         }
 
-        override fun onUpgrade(db: SQLiteDatabase?, oldVersion: Int, newVersion: Int) {
-            db?.execSQL("DROP TABLE IF EXISTS cookies")
+        override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+            if (oldVersion < 2) {
+                // 原版本只保存响应来源域名，迁移时从 Cookie 内容恢复实际的 domain/path。
+                // 使用来源域名解析，才能保留 hostOnly 与会话 Cookie 的原有语义。
+                db.execSQL("ALTER TABLE cookies RENAME TO cookies_v1")
+                onCreate(db)
+                db.rawQuery("SELECT url, cookie FROM cookies_v1", null).use { cursor ->
+                    while (cursor.moveToNext()) {
+                        val sourceUrl = runCatching {
+                            HttpUrl.Builder().scheme("https").host(cursor.getString(0)).build()
+                        }.getOrNull() ?: continue
+                        val cookie = Cookie.parse(sourceUrl, cursor.getString(1)) ?: continue
+                        if (cookie.expiresAt > System.currentTimeMillis()) {
+                            store(db, cookie)
+                        }
+                    }
+                }
+                db.execSQL("DROP TABLE cookies_v1")
+            }
         }
     }
 
@@ -56,15 +75,25 @@ class PersistentCookieJar(
      */
     fun addAll(url: HttpUrl, cookies: List<Cookie>) {
         val db = sqlHelper.writableDatabase
+        val now = System.currentTimeMillis()
         cookies.forEach { cookie ->
-            if (cookie.expiresAt > System.currentTimeMillis()) {
-                db.replace("cookies", null, ContentValues().apply {
-                    put("url", url.host)
-                    put("name", cookie.name)
-                    put("cookie", cookie.toString())
-                })
+            if (cookie.expiresAt > now) {
+                store(db, cookie)
+            } else {
+                // Set-Cookie: Max-Age=0 用于删除已有 Cookie，不能仅跳过此次写入。
+                db.delete("cookies", "url = ? AND name = ? AND path = ?",
+                    arrayOf(cookie.domain, cookie.name, cookie.path))
             }
         }
+    }
+
+    private fun store(db: SQLiteDatabase, cookie: Cookie) {
+        db.replace("cookies", null, ContentValues().apply {
+            put("url", cookie.domain)
+            put("name", cookie.name)
+            put("path", cookie.path)
+            put("cookie", cookie.toString())
+        })
     }
 
     /**
@@ -72,18 +101,31 @@ class PersistentCookieJar(
      */
     fun getAll(url: HttpUrl): List<Cookie> {
         val db = sqlHelper.writableDatabase
-        db.rawQuery("SELECT * FROM cookies WHERE url = ?", arrayOf(url.host)).use { cursor ->
+        // 同时读取当前主机及父域的数据，之后由 OkHttp 判断 hostOnly 与域匹配。
+        // 使用参数化查询，域名永远不直接拼入 SQL。
+        val domains = mutableListOf(url.host)
+        var parentDomain = url.host
+        while ('.' in parentDomain) {
+            parentDomain = parentDomain.substringAfter('.')
+            domains.add(parentDomain)
+        }
+        val placeholders = domains.joinToString(",") { "?" }
+        db.rawQuery("SELECT url, name, path, cookie FROM cookies WHERE url IN ($placeholders)",
+            domains.toTypedArray()).use { cursor ->
             val cookies = mutableListOf<Cookie>()
+            val now = System.currentTimeMillis()
             while (cursor.moveToNext()) {
-                val cookieColumn = cursor.getString(cursor.getColumnIndex("cookie"))
-                val cookie = Cookie.parse(url, cookieColumn)
-                if (cookie != null) {
-                    if (cookie.expiresAt > System.currentTimeMillis()) {
-                        cookies.add(cookie)
-                    } else {
-                        db.delete("cookies", "url = ? AND name = ?", arrayOf(url.host, cookie.name))
-                    }
+                val storedDomain = cursor.getString(0)
+                // hostOnly Cookie 的文本不包含 Domain，需要在它原来的域名下解析。
+                val sourceUrl = url.newBuilder().host(storedDomain).build()
+                val cookie = Cookie.parse(sourceUrl, cursor.getString(3))
+                if (cookie == null || cookie.expiresAt <= now) {
+                    db.delete("cookies", "url = ? AND name = ? AND path = ?",
+                        arrayOf(storedDomain, cursor.getString(1), cursor.getString(2)))
+                    continue
                 }
+                if (cookie.hostOnly && cookie.domain != url.host) continue
+                cookies.add(cookie)
             }
             return cookies
         }
@@ -93,14 +135,24 @@ class PersistentCookieJar(
      * 删除指定域名的所有Cookie
      */
     fun remove(url: HttpUrl) {
-        sqlHelper.writableDatabase.delete("cookies", "url = ?", arrayOf(url.host))
+        removeMatching(url)
     }
 
     /**
      * 删除指定域名下的指定cookie
      */
     fun remove(url: HttpUrl, cookieName: String) {
-        sqlHelper.writableDatabase.delete("cookies", "url = ? AND name = ?", arrayOf(url.host, cookieName))
+        removeMatching(url, cookieName)
+    }
+
+    private fun removeMatching(url: HttpUrl, cookieName: String? = null) {
+        val db = sqlHelper.writableDatabase
+        // getAll 已按域名和 hostOnly 过滤，删除范围与这个域名可读取的 Cookie 保持一致。
+        // 按完整身份删除，保留兄弟域的 hostOnly Cookie，同时移除同名不同路径的全部值。
+        getAll(url).filter { cookieName == null || it.name == cookieName }.forEach { cookie ->
+            db.delete("cookies", "url = ? AND name = ? AND path = ?",
+                arrayOf(cookie.domain, cookie.name, cookie.path))
+        }
     }
 
     /**
@@ -111,10 +163,17 @@ class PersistentCookieJar(
     }
 
     override fun loadForRequest(url: HttpUrl): List<Cookie> {
-        return getAll(url)
+        // 由 OkHttp 的公开匹配规则统一处理域名、路径边界和 secure 属性。
+        // 更具体的路径先发送，符合 RFC 6265 对同名 Cookie 的顺序约定。
+        return getAll(url).filter { it.matches(url) }.sortedByDescending { it.path.length }
     }
 
     override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
         addAll(url, cookies)
+    }
+
+    /** 释放数据库连接；同一个 CookieJar 在关闭后不应继续用于请求。 */
+    override fun close() {
+        sqlHelper.close()
     }
 }

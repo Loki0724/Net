@@ -30,7 +30,20 @@ import com.drake.net.internal.NetDeferred
 import com.drake.net.request.BodyRequest
 import com.drake.net.request.Method
 import com.drake.net.request.UrlRequest
+import com.drake.net.reflect.typeTokenOf
 import kotlinx.coroutines.*
+
+/**
+ * 网络子任务使用带父节点的 SupervisorJob，保留单个请求失败不取消同级请求的语义。
+ * 子请求结束后同步完成监督节点，防止已完成请求遗留活跃 Job 导致父作用域无法结束。
+ */
+@PublishedApi
+internal fun <T> CoroutineScope.netAsync(block: suspend CoroutineScope.() -> T): Deferred<T> {
+    val supervisor = SupervisorJob(coroutineContext[Job])
+    val deferred = CoroutineScope(coroutineContext + supervisor).async(Dispatchers.IO, block = block)
+    deferred.invokeOnCompletion { supervisor.complete() }
+    return NetDeferred(deferred)
+}
 
 
 // <editor-fold desc="异步请求">
@@ -47,7 +60,7 @@ inline fun <reified M> CoroutineScope.Get(
     path: String,
     tag: Any? = null,
     noinline block: (UrlRequest.() -> Unit)? = null
-): Deferred<M> = NetDeferred(async(Dispatchers.IO + SupervisorJob()) {
+): Deferred<M> = netAsync {
     coroutineContext.ensureActive()
     UrlRequest().apply {
         setPath(path)
@@ -55,8 +68,8 @@ inline fun <reified M> CoroutineScope.Get(
         setGroup(coroutineContext[CoroutineExceptionHandler])
         tag(tag)
         block?.invoke(this)
-    }.execute()
-})
+    }.apply { setKType<M>() }.executeCancellable(typeTokenOf<M>())
+}
 
 /**
  * 异步网络请求
@@ -69,7 +82,7 @@ inline fun <reified M> CoroutineScope.Post(
     path: String,
     tag: Any? = null,
     noinline block: (BodyRequest.() -> Unit)? = null
-): Deferred<M> = NetDeferred(async(Dispatchers.IO + SupervisorJob()) {
+): Deferred<M> = netAsync {
     coroutineContext.ensureActive()
     BodyRequest().apply {
         setPath(path)
@@ -77,8 +90,8 @@ inline fun <reified M> CoroutineScope.Post(
         setGroup(coroutineContext[CoroutineExceptionHandler])
         tag(tag)
         block?.invoke(this)
-    }.execute()
-})
+    }.apply { setKType<M>() }.executeCancellable(typeTokenOf<M>())
+}
 
 /**
  * 异步网络请求
@@ -91,7 +104,7 @@ inline fun <reified M> CoroutineScope.Head(
     path: String,
     tag: Any? = null,
     noinline block: (UrlRequest.() -> Unit)? = null
-): Deferred<M> = NetDeferred(async(Dispatchers.IO + SupervisorJob()) {
+): Deferred<M> = netAsync {
     coroutineContext.ensureActive()
     UrlRequest().apply {
         setPath(path)
@@ -99,8 +112,8 @@ inline fun <reified M> CoroutineScope.Head(
         setGroup(coroutineContext[CoroutineExceptionHandler])
         tag(tag)
         block?.invoke(this)
-    }.execute()
-})
+    }.apply { setKType<M>() }.executeCancellable(typeTokenOf<M>())
+}
 
 /**
  * 异步网络请求
@@ -113,7 +126,7 @@ inline fun <reified M> CoroutineScope.Options(
     path: String,
     tag: Any? = null,
     noinline block: (UrlRequest.() -> Unit)? = null
-): Deferred<M> = NetDeferred(async(Dispatchers.IO + SupervisorJob()) {
+): Deferred<M> = netAsync {
     coroutineContext.ensureActive()
     UrlRequest().apply {
         setPath(path)
@@ -121,8 +134,8 @@ inline fun <reified M> CoroutineScope.Options(
         setGroup(coroutineContext[CoroutineExceptionHandler])
         tag(tag)
         block?.invoke(this)
-    }.execute()
-})
+    }.apply { setKType<M>() }.executeCancellable(typeTokenOf<M>())
+}
 
 /**
  * 异步网络请求
@@ -135,7 +148,7 @@ inline fun <reified M> CoroutineScope.Trace(
     path: String,
     tag: Any? = null,
     noinline block: (UrlRequest.() -> Unit)? = null
-): Deferred<M> = NetDeferred(async(Dispatchers.IO + SupervisorJob()) {
+): Deferred<M> = netAsync {
     coroutineContext.ensureActive()
     UrlRequest().apply {
         setPath(path)
@@ -143,8 +156,8 @@ inline fun <reified M> CoroutineScope.Trace(
         setGroup(coroutineContext[CoroutineExceptionHandler])
         tag(tag)
         block?.invoke(this)
-    }.execute()
-})
+    }.apply { setKType<M>() }.executeCancellable(typeTokenOf<M>())
+}
 
 /**
  * 异步网络请求
@@ -157,7 +170,7 @@ inline fun <reified M> CoroutineScope.Delete(
     path: String,
     tag: Any? = null,
     noinline block: (BodyRequest.() -> Unit)? = null
-): Deferred<M> = NetDeferred(async(Dispatchers.IO + SupervisorJob()) {
+): Deferred<M> = netAsync {
     coroutineContext.ensureActive()
     BodyRequest().apply {
         setPath(path)
@@ -165,8 +178,8 @@ inline fun <reified M> CoroutineScope.Delete(
         setGroup(coroutineContext[CoroutineExceptionHandler])
         tag(tag)
         block?.invoke(this)
-    }.execute()
-})
+    }.apply { setKType<M>() }.executeCancellable(typeTokenOf<M>())
+}
 
 /**
  * 异步网络请求
@@ -179,7 +192,7 @@ inline fun <reified M> CoroutineScope.Put(
     path: String,
     tag: Any? = null,
     noinline block: (BodyRequest.() -> Unit)? = null
-): Deferred<M> = NetDeferred(async(Dispatchers.IO + SupervisorJob()) {
+): Deferred<M> = netAsync {
     coroutineContext.ensureActive()
     BodyRequest().apply {
         setPath(path)
@@ -187,8 +200,8 @@ inline fun <reified M> CoroutineScope.Put(
         setGroup(coroutineContext[CoroutineExceptionHandler])
         tag(tag)
         block?.invoke(this)
-    }.execute()
-})
+    }.apply { setKType<M>() }.executeCancellable(typeTokenOf<M>())
+}
 
 /**
  * 异步网络请求
@@ -201,7 +214,7 @@ inline fun <reified M> CoroutineScope.Patch(
     path: String,
     tag: Any? = null,
     noinline block: (BodyRequest.() -> Unit)? = null
-): Deferred<M> = NetDeferred(async(Dispatchers.IO + SupervisorJob()) {
+): Deferred<M> = netAsync {
     coroutineContext.ensureActive()
     BodyRequest().apply {
         setPath(path)
@@ -209,7 +222,6 @@ inline fun <reified M> CoroutineScope.Patch(
         setGroup(coroutineContext[CoroutineExceptionHandler])
         tag(tag)
         block?.invoke(this)
-    }.execute()
+    }.apply { setKType<M>() }.executeCancellable(typeTokenOf<M>())
 }
-)
 // </editor-fold>

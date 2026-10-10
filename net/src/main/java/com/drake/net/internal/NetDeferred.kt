@@ -27,8 +27,11 @@ package com.drake.net.internal
 import com.drake.net.exception.NetException
 import com.drake.net.exception.URLParseException
 import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.InternalForInheritanceCoroutinesApi
 
 @PublishedApi
+// 协程 1.11 显式要求代理 Deferred 的实现声明内部继承契约，行为仍委托给原始任务。
+@OptIn(InternalForInheritanceCoroutinesApi::class)
 internal class NetDeferred<M>(private val deferred: Deferred<M>) : Deferred<M> by deferred {
 
     override suspend fun await(): M {

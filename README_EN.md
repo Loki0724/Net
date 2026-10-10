@@ -100,12 +100,17 @@ dependencyResolutionManagement {
 Add framework dependency to Module's build.gradle
 
 ```groovy
-implementation "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.6.0" // Coroutines (version optional)
-implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.6.0'
-implementation 'com.squareup.okhttp3:okhttp:4.11.0' // Requires OkHttp4+
-implementation 'com.github.liangjingkanji:Net:3.7.0'
+implementation platform('org.jetbrains.kotlinx:kotlinx-coroutines-bom:1.11.0')
+implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-core'
+implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android'
+implementation platform('com.squareup.okhttp3:okhttp-bom:5.5.0')
+implementation 'com.squareup.okhttp3:okhttp'
+implementation project(':net') // This fork has not published a new Maven/JitPack release yet.
 ```
-For development on Android 5 (API level 21) and below, please use [Net-okhttp3](https://github.com/liangjingkanji/Net-okhttp3)
+For development below Android 5 (API level 21), please use [Net-okhttp3](https://github.com/liangjingkanji/Net-okhttp3)
+
+This fork uses OkHttp 5.5.0 and requires `minSdk 21`, `compileSdk 37`, JDK 17, and Kotlin 2.3.21.
+See [the dependency upgrade notes](docs/dependency-upgrade.md) for compatibility and verification commands.
 <br>
 
 ## Contribute
@@ -139,4 +144,4 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-``` 
+```

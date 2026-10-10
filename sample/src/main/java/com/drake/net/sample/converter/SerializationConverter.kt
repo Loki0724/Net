@@ -37,7 +37,7 @@ class SerializationConverter(
             val code = response.code
             when {
                 code in 200..299 -> { // 请求成功
-                    val bodyString = response.body?.string() ?: return null
+                    val bodyString = response.body.string()
                     val kType = response.request.kType
                         ?: throw ConvertException(response, "Request does not contain KType")
                     return try {
